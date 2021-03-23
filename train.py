@@ -25,6 +25,7 @@ from torchvision import transforms
 from torch.autograd import Variable
 import torch.optim as optim
 
+enable_tensorboard = False
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -36,11 +37,11 @@ if __name__ == "__main__":
     parser.add_argument("--pretrained_weights", type=str, help="if specified starts from checkpoint model")
     parser.add_argument("--n_cpu", type=int, default=8, help="number of cpu threads to use during batch generation")
     parser.add_argument("--img_size", type=int, default=416, help="size of each image dimension")
-    parser.add_argument("--checkpoint_interval", type=int, default=1, help="interval between saving model weights")
-    parser.add_argument("--evaluation_interval", type=int, default=1, help="interval evaluations on validation set")
-    parser.add_argument("--compute_map", default=False, help="if True computes mAP every tenth batch")
-    parser.add_argument("--multiscale_training", default=True, help="allow for multi-scale training")
-    parser.add_argument("--verbose", "-v", default=False, action='store_true', help="Makes the training more verbose")
+    parser.add_argument("--checkpoint_interval", type=int, default=5, help="interval between saving model weights")
+    parser.add_argument("--evaluation_interval", type=int, default=5, help="interval evaluations on validation set")
+    parser.add_argument("--compute_map", default=True, help="if True computes mAP every tenth batch")
+    parser.add_argument("--multiscale_training", default=False, help="allow for multi-scale training")
+    parser.add_argument("--verbose", "-v", default=True, action='store_true', help="Makes the training more verbose")
     parser.add_argument("--logdir", type=str, default="logs", help="Defines the directory where the training log files are stored")
     opt = parser.parse_args()
     print(opt)
@@ -57,6 +58,7 @@ if __name__ == "__main__":
     train_path = data_config["train"]
     valid_path = data_config["valid"]
     class_names = load_classes(data_config["names"])
+    print(class_names)
 
     # Initiate model
     model = Darknet(opt.model_def).to(device)
@@ -102,7 +104,7 @@ if __name__ == "__main__":
     for epoch in range(opt.epochs):
         model.train()
         start_time = time.time()
-        for batch_i, (_, imgs, targets) in enumerate(tqdm.tqdm(dataloader, desc=f"Training Epoch {epoch}")):
+        for batch_i, (_, imgs, targets) in enumerate(tqdm.tqdm(dataloader, desc='Training Epoch {}'.format(epoch))):
             batches_done = len(dataloader) * epoch + batch_i
 
             imgs = Variable(imgs.to(device))
@@ -122,7 +124,7 @@ if __name__ == "__main__":
 
             log_str = "\n---- [Epoch %d/%d, Batch %d/%d] ----\n" % (epoch, opt.epochs, batch_i, len(dataloader))
 
-            metric_table = [["Metrics", *[f"YOLO Layer {i}" for i in range(len(model.yolo_layers))]]]
+            metric_table = [["Metrics", *['YOLO Layer {}'.format(i) for i in range(len(model.yolo_layers))]]]
 
             # Log metrics at each YOLO layer
             for i, metric in enumerate(metrics):
@@ -133,57 +135,58 @@ if __name__ == "__main__":
                 metric_table += [[metric, *row_metrics]]
 
             log_str += AsciiTable(metric_table).table
-            log_str += f"\nTotal loss {to_cpu(loss).item()}"
+            log_str += '\nTotal loss {}'.format(to_cpu(loss).item())
 
-            # Tensorboard logging
-            tensorboard_log = []
-            for j, yolo in enumerate(model.yolo_layers):
-                for name, metric in yolo.metrics.items():
-                    if name != "grid_size":
-                        tensorboard_log += [(f"train/{name}_{j+1}", metric)]
-            tensorboard_log += [("train/loss", to_cpu(loss).item())]
-            logger.list_of_scalars_summary(tensorboard_log, batches_done)
+            if enable_tensorboard:
+                # Tensorboard logging
+                tensorboard_log = []
+                for j, yolo in enumerate(model.yolo_layers):
+                    for name, metric in yolo.metrics.items():
+                        if name != "grid_size":
+                            tensorboard_log += [('train/{}_{}'.format(name,j+1), metric)]
+                tensorboard_log += [("train/loss", to_cpu(loss).item())]
+                logger.list_of_scalars_summary(tensorboard_log, batches_done)
 
             # Determine approximate time left for epoch
             epoch_batches_left = len(dataloader) - (batch_i + 1)
             time_left = datetime.timedelta(seconds=epoch_batches_left * (time.time() - start_time) / (batch_i + 1))
-            log_str += f"\n---- ETA {time_left}"
+            log_str += '\n---- ETA {}'.format(time_left)
 
             if opt.verbose: print(log_str)
 
             model.seen += imgs.size(0)
 
-        if epoch % opt.evaluation_interval == 0:
-            print("\n---- Evaluating Model ----")
-            # Evaluate the model on the validation set
-            metrics_output = evaluate(
-                model,
-                path=valid_path,
-                iou_thres=0.5,
-                conf_thres=0.5,
-                nms_thres=0.5,
-                img_size=opt.img_size,
-                batch_size=8,
-            )
+        # if epoch % opt.evaluation_interval == 0:
+        #     print("\n---- Evaluating Model ----")
+        #     # Evaluate the model on the validation set
+        #     metrics_output = evaluate(
+        #         model,
+        #         path=valid_path,
+        #         iou_thres=0.5,
+        #         conf_thres=0.5,
+        #         nms_thres=0.5,
+        #         img_size=opt.img_size,
+        #         batch_size=8,
+        #     )
             
-            if metrics_output is not None:
-                precision, recall, AP, f1, ap_class = metrics_output
-                evaluation_metrics = [
-                ("validation/precision", precision.mean()),
-                ("validation/recall", recall.mean()),
-                ("validation/mAP", AP.mean()),
-                ("validation/f1", f1.mean()),
-                ]
-                logger.list_of_scalars_summary(evaluation_metrics, epoch)
+        #     if metrics_output is not None:
+        #         precision, recall, AP, f1, ap_class = metrics_output
+        #         evaluation_metrics = [
+        #         ("validation/precision", precision.mean()),
+        #         ("validation/recall", recall.mean()),
+        #         ("validation/mAP", AP.mean()),
+        #         ("validation/f1", f1.mean()),
+        #         ]
+        #         logger.list_of_scalars_summary(evaluation_metrics, epoch)
 
-                # Print class APs and mAP
-                ap_table = [["Index", "Class name", "AP"]]
-                for i, c in enumerate(ap_class):
-                    ap_table += [[c, class_names[c], "%.5f" % AP[i]]]
-                print(AsciiTable(ap_table).table)
-                print(f"---- mAP {AP.mean()}")                
-            else:
-                print( "---- mAP not measured (no detections found by model)")
+        #         # Print class APs and mAP
+        #         ap_table = [["Index", "Class name", "AP"]]
+        #         for i, c in enumerate(ap_class):
+        #             ap_table += [[c, class_names[c], "%.5f" % AP[i]]]
+        #         print(AsciiTable(ap_table).table)
+        #         print('---- mAP {}'.format(AP.mean()))                
+        #     else:
+        #         print( "---- mAP not measured (no detections found by model)")
 
         if epoch % opt.checkpoint_interval == 0:
-            torch.save(model.state_dict(), f"checkpoints/yolov3_ckpt_%d.pth" % epoch)
+            torch.save(model.state_dict(), 'checkpoints/yolov3_ckpt_{}.pth'.format(epoch))
