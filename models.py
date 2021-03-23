@@ -28,8 +28,9 @@ def create_modules(module_defs):
             filters = int(module_def["filters"])
             kernel_size = int(module_def["size"])
             pad = (kernel_size - 1) // 2
+            print('in_channels= ', output_filters[-1])
             modules.add_module(
-                f"conv_{module_i}",
+                'conv_{}'.format(module_i),
                 nn.Conv2d(
                     in_channels=output_filters[-1],
                     out_channels=filters,
@@ -40,30 +41,30 @@ def create_modules(module_defs):
                 ),
             )
             if bn:
-                modules.add_module(f"batch_norm_{module_i}", nn.BatchNorm2d(filters, momentum=0.9, eps=1e-5))
+                modules.add_module('batch_norm_{}'.format(module_i), nn.BatchNorm2d(filters, momentum=0.9, eps=1e-5))
             if module_def["activation"] == "leaky":
-                modules.add_module(f"leaky_{module_i}", nn.LeakyReLU(0.1))
+                modules.add_module('leaky_{}'.format(module_i), nn.LeakyReLU(0.1))
 
         elif module_def["type"] == "maxpool":
             kernel_size = int(module_def["size"])
             stride = int(module_def["stride"])
             if kernel_size == 2 and stride == 1:
-                modules.add_module(f"_debug_padding_{module_i}", nn.ZeroPad2d((0, 1, 0, 1)))
+                modules.add_module('_debug_padding_{}'.format(module_i), nn.ZeroPad2d((0, 1, 0, 1)))
             maxpool = nn.MaxPool2d(kernel_size=kernel_size, stride=stride, padding=int((kernel_size - 1) // 2))
-            modules.add_module(f"maxpool_{module_i}", maxpool)
+            modules.add_module('maxpool_{}'.format(module_i), maxpool)
 
         elif module_def["type"] == "upsample":
             upsample = Upsample(scale_factor=int(module_def["stride"]), mode="nearest")
-            modules.add_module(f"upsample_{module_i}", upsample)
+            modules.add_module('upsample_{}'.format(module_i), upsample)
 
         elif module_def["type"] == "route":
             layers = [int(x) for x in module_def["layers"].split(",")]
             filters = sum([output_filters[1:][i] for i in layers])
-            modules.add_module(f"route_{module_i}", nn.Sequential())
+            modules.add_module('route_{}'.format(module_i), EmptyLayer())
 
         elif module_def["type"] == "shortcut":
             filters = output_filters[1:][int(module_def["from"])]
-            modules.add_module(f"shortcut_{module_i}", nn.Sequential())
+            modules.add_module('shortcut_{}'.format(module_i), EmptyLayer())
 
         elif module_def["type"] == "yolo":
             anchor_idxs = [int(x) for x in module_def["mask"].split(",")]
@@ -75,7 +76,21 @@ def create_modules(module_defs):
             img_size = int(hyperparams["height"])
             # Define detection layer
             yolo_layer = YOLOLayer(anchors, num_classes, img_size)
-            modules.add_module(f"yolo_{module_i}", yolo_layer)
+            modules.add_module('yolo_{}'.format(module_i), yolo_layer)
+        
+        
+
+        elif module_def["type"] == "acff":
+            filters = int(module_def["filters"])
+            kernel_size = int(module_def["size"])
+            modules.add_module(
+                'conv_{}'.format(module_i),
+                ACFF(
+                    in_channels=output_filters[-1],
+                    out_channels=filters,
+                    kernel_size=kernel_size
+                ),
+            )
         # Register module list and number of output filters
         module_list.append(modules)
         output_filters.append(filters)
@@ -92,8 +107,18 @@ class Upsample(nn.Module):
         self.mode = mode
 
     def forward(self, x):
-        x = F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
+        x = F.interpolate(x, size=(self.scale_factor,self.scale_factor), mode=self.mode)
+        #x = F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
+        #print('Upsample shape= ',x.shape)
         return x
+
+
+class EmptyLayer(nn.Module):
+    """Placeholder for 'route' and 'shortcut' layers"""
+
+    def __init__(self):
+        super(EmptyLayer, self).__init__()
+
 
 class YOLOLayer(nn.Module):
     """Detection layer"""
@@ -134,6 +159,7 @@ class YOLOLayer(nn.Module):
         num_samples = x.size(0)
         grid_size = x.size(2)
 
+        #print('YOLO fwd= ',x.shape)
         prediction = (
             x.view(num_samples, self.num_anchors, self.num_classes + 5, grid_size, grid_size)
             .permute(0, 1, 3, 4, 2)
@@ -229,6 +255,7 @@ class Darknet(nn.Module):
         super(Darknet, self).__init__()
         self.module_defs = parse_model_config(config_path)
         self.hyperparams, self.module_list = create_modules(self.module_defs)
+        print('Finished creating modules.')
         self.yolo_layers = [layer[0] for layer in self.module_list if isinstance(layer[0], YOLOLayer)]
         self.img_size = img_size
         self.seen = 0
@@ -239,7 +266,9 @@ class Darknet(nn.Module):
         loss = 0
         layer_outputs, yolo_outputs = [], []
         for i, (module_def, module) in enumerate(zip(self.module_defs, self.module_list)):
-            if module_def["type"] in ["convolutional", "upsample", "maxpool"]:
+            #print('i= ',i, "module_def: ",module_def)
+            if module_def["type"] in ["convolutional", "upsample", "maxpool","acff"]:
+                #print(module)
                 x = module(x)
             elif module_def["type"] == "route":
                 x = torch.cat([layer_outputs[int(layer_i)] for layer_i in module_def["layers"].split(",")], 1)
@@ -334,3 +363,59 @@ class Darknet(nn.Module):
                 conv_layer.weight.data.cpu().numpy().tofile(fp)
 
         fp.close()
+
+debug = False
+'''Atrous Convolution Feature Fusion (ACFF) Block'''
+
+
+class ACFF(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size,):
+        super(ACFF, self).__init__()
+
+        ''' 
+        Dilated Convolution
+        i = input
+        o = output
+        p = padding
+        k = kernel_size
+        s = stride
+        d = dilation
+        
+        o = [i + 2*p - k - (k-1)*(d-1)]/s + 1
+        '''
+
+        self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, stride=1, padding=0, dilation=1,
+                               groups=in_channels, bias=True)
+        self.conv2 = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, stride=1, padding=1, dilation=2,
+                               groups=in_channels, bias=True)
+        self.conv3 = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, stride=1, padding=2, dilation=3,
+                               groups=in_channels, bias=True)
+        self.fused_conv = nn.Conv2d(in_channels * 3, out_channels, kernel_size=1, stride=1, padding=0, dilation=1,
+                                    bias=True)
+        self.leaky_relu = nn.LeakyReLU(0.01)
+        self.batch_norm = nn.BatchNorm2d(out_channels)
+        self.dropout = nn.Dropout(0.2)
+
+    def forward(self, x):
+
+        if debug:
+            print('Shape of input in ACFF Forward= ', x.shape)
+            print('Output of layer1(x): ', self.conv1(x).shape)
+            print('Output of layer2(x): ', self.conv2(x).shape)
+            print('Output of layer3(x): ', self.conv3(x).shape)
+
+        # Fusion
+        out = torch.cat((self.conv1(x), self.conv2(x), self.conv3(x)), 1)
+
+        if debug:
+            print('Shape after concat in ACFF forward: ', out.shape)
+
+        out = self.fused_conv(out)
+        out = self.leaky_relu(out)
+        out = self.batch_norm(out)
+        out = self.dropout(out)
+
+        if debug:
+            print('Final shape of ACFF out: ', out.shape, '\n')
+
+        return out
